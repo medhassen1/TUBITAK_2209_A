@@ -348,11 +348,7 @@ MIT License - Feel free to use this code for educational or personal projects!
 
 ## 👨‍💻 Author
 
-Ibrahim E. EL-Serwy
-Mohamed Zeyadne
-Kirubeal Kassa
-ALi Adeel
-Nour Eddine 
+Created with ❤️ for physics enthusiasts and curious minds everywhere.
 
 ## 🙏 Acknowledgments
 
@@ -366,4 +362,3 @@ Nour Eddine
 **Enjoy exploring the beautiful chaos of the Three-Body Problem!** 🌌
 
 If you find this simulator helpful or interesting, please consider giving it a star ⭐
-

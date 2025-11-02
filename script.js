@@ -45,6 +45,27 @@ class Simulation {
         this.showVelocity = false;
         this.followCenterOfMass = true;
         this.initialEnergy = 0;
+        this.integrator = 'rk4'; // 'rk4' or 'verlet' (symplectic)
+        
+        // Analysis data tracking
+        this.energyHistory = [];
+        this.angularMomentumHistory = [];
+        this.distanceHistory = { r12: [], r23: [], r13: [] };
+        this.timeHistory = [];
+        this.maxHistoryLength = 500;
+        
+        // Period detection
+        this.positionHistory = [];  // Store positions for period detection
+        this.detectedPeriod = null;
+        this.lastPeriodCheck = 0;
+        
+        // Advanced analysis
+        this.poincarePoints = [];  // Store Poincaré section crossings
+        this.lyapunovEnabled = false;
+        this.shadowBodies = [];  // For Lyapunov calculation
+        this.initialSeparation = 1e-8;
+        this.lyapunovSum = 0;
+        this.lyapunovSamples = 0;
     }
 
     addBody(x, y, vx, vy, mass, color, name) {
@@ -54,6 +75,7 @@ class Simulation {
     clearBodies() {
         this.bodies = [];
         this.time = 0;
+        this.clearHistory();
     }
 
     calculateAccelerations() {
@@ -153,17 +175,58 @@ class Simulation {
         this.time += this.dt;
     }
 
+    // Velocity Verlet integration (symplectic - better energy conservation)
+    stepVerlet() {
+        const bodies = this.bodies;
+        
+        // Store current accelerations
+        this.calculateAccelerations();
+        const oldAccel = bodies.map(b => ({ ax: b.ax, ay: b.ay }));
+        
+        // Update positions: x(t + dt) = x(t) + v(t) * dt + 0.5 * a(t) * dt^2
+        for (let i = 0; i < bodies.length; i++) {
+            bodies[i].x += bodies[i].vx * this.dt + 0.5 * oldAccel[i].ax * this.dt * this.dt;
+            bodies[i].y += bodies[i].vy * this.dt + 0.5 * oldAccel[i].ay * this.dt * this.dt;
+        }
+        
+        // Calculate new accelerations at new positions
+        this.calculateAccelerations();
+        
+        // Update velocities: v(t + dt) = v(t) + 0.5 * (a(t) + a(t + dt)) * dt
+        for (let i = 0; i < bodies.length; i++) {
+            bodies[i].vx += 0.5 * (oldAccel[i].ax + bodies[i].ax) * this.dt;
+            bodies[i].vy += 0.5 * (oldAccel[i].ay + bodies[i].ay) * this.dt;
+        }
+        
+        this.time += this.dt;
+    }
+
     update() {
         if (this.paused) return;
 
         const steps = Math.ceil(this.speed * 10);
         for (let i = 0; i < steps; i++) {
-            this.step();
+            if (this.integrator === 'verlet') {
+                this.stepVerlet();
+            } else {
+                this.step();
+            }
         }
 
         // Update trails
         for (let body of this.bodies) {
             body.addTrailPoint();
+        }
+        
+        // Track analysis data (every 10th frame to reduce overhead)
+        if (Math.floor(this.time / this.dt) % 10 === 0) {
+            this.trackAnalysisData();
+            this.checkPoincareSection();
+        }
+        
+        // Calculate Lyapunov if enabled
+        if (this.lyapunovEnabled) {
+            this.calculateLyapunovExponent();
         }
     }
 
@@ -190,6 +253,227 @@ class Simulation {
         }
 
         return kineticEnergy + potentialEnergy;
+    }
+
+    calculateAngularMomentum() {
+        let L = 0;
+        const com = this.getCenterOfMass();
+        
+        for (let body of this.bodies) {
+            const rx = body.x - com.x;
+            const ry = body.y - com.y;
+            // L = r × p = r × mv (z-component only for 2D)
+            L += body.mass * (rx * body.vy - ry * body.vx);
+        }
+        
+        return L;
+    }
+
+    getPairwiseDistances() {
+        if (this.bodies.length < 3) return { r12: 0, r23: 0, r13: 0 };
+        
+        const dx12 = this.bodies[1].x - this.bodies[0].x;
+        const dy12 = this.bodies[1].y - this.bodies[0].y;
+        const r12 = Math.sqrt(dx12 * dx12 + dy12 * dy12);
+        
+        const dx23 = this.bodies[2].x - this.bodies[1].x;
+        const dy23 = this.bodies[2].y - this.bodies[1].y;
+        const r23 = Math.sqrt(dx23 * dx23 + dy23 * dy23);
+        
+        const dx13 = this.bodies[2].x - this.bodies[0].x;
+        const dy13 = this.bodies[2].y - this.bodies[0].y;
+        const r13 = Math.sqrt(dx13 * dx13 + dy13 * dy13);
+        
+        return { r12, r23, r13 };
+    }
+
+    trackAnalysisData() {
+        this.timeHistory.push(this.time);
+        this.energyHistory.push(this.calculateEnergy());
+        this.angularMomentumHistory.push(this.calculateAngularMomentum());
+        
+        const distances = this.getPairwiseDistances();
+        this.distanceHistory.r12.push(distances.r12);
+        this.distanceHistory.r23.push(distances.r23);
+        this.distanceHistory.r13.push(distances.r13);
+        
+        // Store first body's position for period detection
+        if (this.bodies.length > 0) {
+            const body = this.bodies[0];
+            this.positionHistory.push({
+                x: body.x,
+                y: body.y,
+                vx: body.vx,
+                vy: body.vy
+            });
+        }
+        
+        // Limit history length
+        if (this.timeHistory.length > this.maxHistoryLength) {
+            this.timeHistory.shift();
+            this.energyHistory.shift();
+            this.angularMomentumHistory.shift();
+            this.distanceHistory.r12.shift();
+            this.distanceHistory.r23.shift();
+            this.distanceHistory.r13.shift();
+            this.positionHistory.shift();
+        }
+    }
+
+    clearHistory() {
+        this.energyHistory = [];
+        this.angularMomentumHistory = [];
+        this.distanceHistory = { r12: [], r23: [], r13: [] };
+        this.timeHistory = [];
+        this.positionHistory = [];
+        this.detectedPeriod = null;
+        this.lastPeriodCheck = 0;
+        this.poincarePoints = [];
+        this.lyapunovSum = 0;
+        this.lyapunovSamples = 0;
+        this.shadowBodies = [];
+    }
+
+    detectPeriod() {
+        // Only check periodicity every 5 time units to avoid false positives
+        if (this.time - this.lastPeriodCheck < 5) return;
+        this.lastPeriodCheck = this.time;
+        
+        // Need at least 100 points
+        if (this.positionHistory.length < 100) return;
+        
+        // Simple period detection: look for when body returns near starting position
+        const startPos = this.positionHistory[0];
+        const threshold = 0.1;  // Distance threshold for "close enough"
+        
+        // Check recent positions for return to start
+        for (let i = Math.max(50, Math.floor(this.positionHistory.length / 2)); i < this.positionHistory.length - 10; i++) {
+            const pos = this.positionHistory[i];
+            const dx = pos.x - startPos.x;
+            const dy = pos.y - startPos.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            
+            if (dist < threshold) {
+                // Check if velocities also match
+                const dvx = pos.vx - startPos.vx;
+                const dvy = pos.vy - startPos.vy;
+                const vdist = Math.sqrt(dvx * dvx + dvy * dvy);
+                
+                if (vdist < threshold) {
+                    const period = this.timeHistory[i] - this.timeHistory[0];
+                    if (period > 1.0) {  // Minimum reasonable period
+                        this.detectedPeriod = period;
+                        return period;
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    checkPoincareSection() {
+        // Check if body crosses y=0 plane with positive velocity
+        if (this.bodies.length === 0) return;
+        
+        const body = this.bodies[0];  // Track first body
+        const prevY = this.positionHistory.length > 0 ? 
+                      this.positionHistory[this.positionHistory.length - 1].y : 0;
+        
+        // Check for crossing (sign change) and moving upward
+        if (prevY < 0 && body.y >= 0 && body.vy > 0) {
+            this.poincarePoints.push({
+                x: body.x,
+                vx: body.vx,
+                time: this.time
+            });
+            
+            // Limit points
+            if (this.poincarePoints.length > 500) {
+                this.poincarePoints.shift();
+            }
+        }
+    }
+
+    initializeLyapunov() {
+        // Create shadow system with tiny perturbation
+        this.shadowBodies = this.bodies.map(body => ({
+            x: body.x + this.initialSeparation,
+            y: body.y,
+            vx: body.vx,
+            vy: body.vy,
+            mass: body.mass,
+            ax: 0,
+            ay: 0
+        }));
+    }
+
+    calculateLyapunovExponent() {
+        if (!this.lyapunovEnabled || this.shadowBodies.length === 0) return null;
+        
+        // Calculate accelerations for shadow system
+        for (let body of this.shadowBodies) {
+            body.ax = 0;
+            body.ay = 0;
+        }
+        
+        for (let i = 0; i < this.shadowBodies.length; i++) {
+            for (let j = i + 1; j < this.shadowBodies.length; j++) {
+                const body1 = this.shadowBodies[i];
+                const body2 = this.shadowBodies[j];
+                
+                const dx = body2.x - body1.x;
+                const dy = body2.y - body1.y;
+                const distSq = dx * dx + dy * dy;
+                const dist = Math.sqrt(distSq);
+                
+                const softening = 0.01;
+                const force = (this.G * body1.mass * body2.mass) / (distSq + softening * softening);
+                
+                const fx = force * dx / dist;
+                const fy = force * dy / dist;
+                
+                body1.ax += fx / body1.mass;
+                body1.ay += fy / body1.mass;
+                body2.ax -= fx / body2.mass;
+                body2.ay -= fy / body2.mass;
+            }
+        }
+        
+        // Update shadow system (simple Euler for speed)
+        for (let body of this.shadowBodies) {
+            body.vx += body.ax * this.dt;
+            body.vy += body.ay * this.dt;
+            body.x += body.vx * this.dt;
+            body.y += body.vy * this.dt;
+        }
+        
+        // Calculate separation
+        let separation = 0;
+        for (let i = 0; i < this.bodies.length; i++) {
+            const dx = this.shadowBodies[i].x - this.bodies[i].x;
+            const dy = this.shadowBodies[i].y - this.bodies[i].y;
+            separation += Math.sqrt(dx * dx + dy * dy);
+        }
+        separation /= this.bodies.length;
+        
+        // Calculate Lyapunov exponent
+        if (separation > this.initialSeparation * 1.1) {
+            const lambda = Math.log(separation / this.initialSeparation) / this.time;
+            this.lyapunovSum += lambda;
+            this.lyapunovSamples++;
+            
+            // Renormalize to prevent overflow
+            const scale = this.initialSeparation / separation;
+            for (let i = 0; i < this.shadowBodies.length; i++) {
+                this.shadowBodies[i].x = this.bodies[i].x + (this.shadowBodies[i].x - this.bodies[i].x) * scale;
+                this.shadowBodies[i].y = this.bodies[i].y + (this.shadowBodies[i].y - this.bodies[i].y) * scale;
+                this.shadowBodies[i].vx = this.bodies[i].vx + (this.shadowBodies[i].vx - this.bodies[i].vx) * scale;
+                this.shadowBodies[i].vy = this.bodies[i].vy + (this.shadowBodies[i].vy - this.bodies[i].vy) * scale;
+            }
+        }
+        
+        return this.lyapunovSamples > 0 ? this.lyapunovSum / this.lyapunovSamples : 0;
     }
 
     getCenterOfMass() {
@@ -642,6 +926,12 @@ class UIController {
             simulation.followCenterOfMass = e.target.checked;
         });
 
+        // Integrator selection
+        document.getElementById('integratorSelect').addEventListener('change', (e) => {
+            simulation.integrator = e.target.value;
+            console.log(`Switched to ${e.target.value === 'verlet' ? 'Velocity Verlet (Symplectic)' : 'RK4'} integrator`);
+        });
+
         // Preset buttons
         document.querySelectorAll('.preset-btn').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -942,6 +1232,8 @@ class UIController {
 
         simulation.initialEnergy = simulation.calculateEnergy();
         this.updateBodyConfig();
+        updateConfigTable(); // Update the config table immediately
+        this.displayInitialConditions(presetName, preset); // Show IC card
         
         // Reset camera
         renderer.targetScale = 100;
@@ -949,8 +1241,75 @@ class UIController {
         renderer.targetOffsetY = 0;
     }
 
+    displayInitialConditions(presetName, preset) {
+        const container = document.getElementById('icDisplay');
+        if (!container) {
+            console.warn('IC Display container not found');
+            return;
+        }
+        if (!preset || !preset.bodies) {
+            console.warn('Invalid preset data');
+            return;
+        }
+        
+        // Map preset names to sources
+        const sources = {
+            'figure8': 'Šuvakov & Dmitrašinović (2013) - Figure-8',
+            'butterflyI': 'Šuvakov & Dmitrašinović (2013) - Butterfly-I',
+            'butterflyII': 'Šuvakov & Dmitrašinović (2013) - Butterfly-II',
+            'bumblebee': 'Šuvakov & Dmitrašinović (2013) - Bumblebee',
+            'dragonfly': 'Šuvakov & Dmitrašinović (2013) - Dragonfly',
+            'goggles': 'Šuvakov & Dmitrašinović (2013) - Goggles',
+            'mothI': 'Šuvakov & Dmitrašinović (2013) - Moth-I',
+            'mothII': 'Šuvakov & Dmitrašinović (2013) - Moth-II',
+            'lagrange': 'Lagrange (1772) - Equilateral Triangle',
+            'binary': 'Classical - Binary System',
+            'chaotic': 'Classical - Chaotic Example',
+            'random': 'Random Generated'
+        };
+        
+        const source = sources[presetName] || 'Custom';
+        
+        let html = `
+            <div class="ic-card">
+                <div class="ic-header">
+                    <div class="ic-title">${preset.name || presetName}</div>
+                    <div class="ic-source">${source}</div>
+                </div>
+        `;
+        
+        preset.bodies.forEach((body, i) => {
+            html += `
+                <div class="ic-body">
+                    <div class="ic-body-name" style="color: ${body.color};">● ${body.name}</div>
+                    <div class="ic-params">
+                        <div class="ic-param"><span class="ic-param-label">m:</span> ${body.mass.toFixed(4)}</div>
+                        <div class="ic-param"><span class="ic-param-label">x:</span> ${body.x.toFixed(4)}</div>
+                        <div class="ic-param"><span class="ic-param-label">y:</span> ${body.y.toFixed(4)}</div>
+                        <div class="ic-param"><span class="ic-param-label">vx:</span> ${body.vx.toFixed(4)}</div>
+                        <div class="ic-param"><span class="ic-param-label">vy:</span> ${body.vy.toFixed(4)}</div>
+                    </div>
+                </div>
+            `;
+        });
+        
+        html += `
+                <div class="ic-actions">
+                    <button class="btn-copy" onclick="copyICAsJSON()">📋 Copy as JSON</button>
+                    <button class="btn-copy" onclick="copyICAsText()">📄 Copy as Text</button>
+                </div>
+            </div>
+        `;
+        
+        container.innerHTML = html;
+    }
+
     updateBodyConfig() {
         const container = document.getElementById('bodyConfig');
+        if (!container) {
+            // bodyConfig was replaced with configTable, skip this
+            return;
+        }
         container.innerHTML = '';
 
         simulation.bodies.forEach((body, index) => {
@@ -1011,26 +1370,559 @@ class UIController {
 let simulation;
 let renderer;
 let uiController;
+let analysisController;
 let currentPreset = 'figure8';
 
 function init() {
-    const canvas = document.getElementById('simulationCanvas');
-    simulation = new Simulation();
-    renderer = new Renderer(canvas);
-    uiController = new UIController();
+    try {
+        console.log('Initializing Three-Body Simulator...');
+        
+        const canvas = document.getElementById('simulationCanvas');
+        if (!canvas) {
+            throw new Error('Canvas element not found!');
+        }
+        
+        console.log('Creating Simulation...');
+        simulation = new Simulation();
+        console.log('✓ Simulation created');
+        
+        console.log('Creating Renderer...');
+        renderer = new Renderer(canvas);
+        console.log('✓ Renderer created');
+        
+        console.log('Creating UI Controller...');
+        uiController = new UIController();
+        console.log('✓ UI Controller created');
+        
+        console.log('Creating Analysis Controller...');
+        analysisController = new AnalysisController();
+        console.log('✓ Analysis Controller created');
 
-    // Load initial preset
-    uiController.loadPreset('figure8');
+        console.log('Loading initial preset...');
+        uiController.loadPreset('figure8');
+        console.log('✓ Initial preset loaded');
+        
+        // Check for URL parameters to load shared configuration
+        const params = new URLSearchParams(window.location.search);
+        if (params.has('preset')) {
+            const preset = params.get('preset');
+            if (typeof PRESETS !== 'undefined' && PRESETS[preset]) {
+                uiController.loadPreset(preset);
+            }
+        }
+        if (params.has('integrator')) {
+            const integrator = params.get('integrator');
+            if (integrator === 'verlet' || integrator === 'rk4') {
+                simulation.integrator = integrator;
+                const integratorSelect = document.getElementById('integratorSelect');
+                if (integratorSelect) {
+                    integratorSelect.value = integrator;
+                }
+            }
+        }
 
-    // Start animation loop
-    animate();
-}
-
-function animate() {
+        // Start animation loop
+        animate();
+        console.log('✅ Simulator initialized successfully!');
+    } catch (error) {
+        console.error('❌ Initialization error:', error);
+        console.error('Error stack:', error.stack);
+        alert('Error initializing simulator: ' + error.message + '\n\nCheck browser console (F12) for details.');
+    }
+}function animate() {
+    if (!simulation || !renderer || !uiController || !analysisController) return;
+    
     simulation.update();
     renderer.render();
     uiController.updateInfo();
+    analysisController.update();
     requestAnimationFrame(animate);
+}
+
+// ============================================
+// ANALYSIS CONTROLLER
+// ============================================
+
+class AnalysisController {
+    constructor() {
+        try {
+            this.energyCanvas = document.getElementById('energyChart');
+            this.angularMomentumCanvas = document.getElementById('angularMomentumChart');
+            this.distanceCanvas = document.getElementById('distanceChart');
+            
+            this.energyCtx = this.energyCanvas ? this.energyCanvas.getContext('2d') : null;
+            this.angularCtx = this.angularMomentumCanvas ? this.angularMomentumCanvas.getContext('2d') : null;
+            this.distanceCtx = this.distanceCanvas ? this.distanceCanvas.getContext('2d') : null;
+            
+            this.poincareCanvas = null;
+            this.poincareCtx = null;
+            
+            this.setupEventListeners();
+            this.collapsed = false;
+        } catch (error) {
+            console.error('AnalysisController initialization error:', error);
+        }
+    }
+    
+    setupEventListeners() {
+        // Toggle panel
+        document.getElementById('toggleAnalysis').addEventListener('click', () => {
+            this.collapsed = !this.collapsed;
+            const content = document.getElementById('analysisContent');
+            const btn = document.getElementById('toggleAnalysis');
+            
+            if (this.collapsed) {
+                content.style.display = 'none';
+                btn.textContent = '▶';
+            } else {
+                content.style.display = 'block';
+                btn.textContent = '▼';
+            }
+        });
+        
+        // Export CSV
+        document.getElementById('exportCSV').addEventListener('click', () => {
+            this.exportCSV();
+        });
+        
+        // Export JSON
+        document.getElementById('exportJSON').addEventListener('click', () => {
+            this.exportJSON();
+        });
+        
+        // Share link
+        document.getElementById('shareLink').addEventListener('click', () => {
+            this.generateShareLink();
+        });
+        
+        // Poincaré section toggle
+        document.getElementById('enablePoincare').addEventListener('change', (e) => {
+            const canvas = document.getElementById('poincareChart');
+            canvas.style.display = e.target.checked ? 'block' : 'none';
+            this.poincareCanvas = canvas;
+            this.poincareCtx = canvas.getContext('2d');
+        });
+        
+        // Lyapunov exponent toggle
+        document.getElementById('enableLyapunov').addEventListener('change', (e) => {
+            const display = document.getElementById('lyapunovDisplay');
+            display.style.display = e.target.checked ? 'block' : 'none';
+            simulation.lyapunovEnabled = e.target.checked;
+            
+            if (e.target.checked && simulation.shadowBodies.length === 0) {
+                simulation.initializeLyapunov();
+            }
+        });
+    }
+    
+    drawChart(ctx, canvas, data, color, label, showMultiple = false, colors = []) {
+        const width = canvas.width;
+        const height = canvas.height;
+        const padding = 10;
+        
+        ctx.clearRect(0, 0, width, height);
+        
+        if (!data || data.length === 0) return;
+        
+        // Single line chart
+        if (!showMultiple) {
+            const min = Math.min(...data);
+            const max = Math.max(...data);
+            const range = max - min || 1;
+            
+            ctx.beginPath();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            
+            data.forEach((value, i) => {
+                const x = padding + (i / (data.length - 1)) * (width - 2 * padding);
+                const y = height - padding - ((value - min) / range) * (height - 2 * padding);
+                
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            
+            ctx.stroke();
+        } else {
+            // Multiple lines
+            const allValues = [...data.r12, ...data.r23, ...data.r13];
+            const min = Math.min(...allValues);
+            const max = Math.max(...allValues);
+            const range = max - min || 1;
+            
+            const datasets = [
+                { data: data.r12, color: colors[0] || '#ff6b6b' },
+                { data: data.r23, color: colors[1] || '#4ecdc4' },
+                { data: data.r13, color: colors[2] || '#ffe66d' }
+            ];
+            
+            datasets.forEach(dataset => {
+                ctx.beginPath();
+                ctx.strokeStyle = dataset.color;
+                ctx.lineWidth = 1.5;
+                
+                dataset.data.forEach((value, i) => {
+                    const x = padding + (i / (dataset.data.length - 1)) * (width - 2 * padding);
+                    const y = height - padding - ((value - min) / range) * (height - 2 * padding);
+                    
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                
+                ctx.stroke();
+            });
+        }
+    }
+    
+    update() {
+        if (this.collapsed || !simulation || simulation.energyHistory.length === 0) return;
+        if (!this.energyCtx || !this.angularCtx || !this.distanceCtx) return; // Safety check
+        
+        // Update energy chart
+        this.drawChart(this.energyCtx, this.energyCanvas, simulation.energyHistory, '#6366f1', 'Energy');
+        
+        // Calculate and display energy drift
+        const currentEnergy = simulation.energyHistory[simulation.energyHistory.length - 1];
+        const drift = ((currentEnergy - simulation.initialEnergy) / Math.abs(simulation.initialEnergy)) * 100;
+        document.getElementById('energyDrift').textContent = drift.toFixed(4) + '%';
+        
+        // Calculate max drift
+        const maxDrift = Math.max(...simulation.energyHistory.map((e, i) => 
+            Math.abs((e - simulation.initialEnergy) / Math.abs(simulation.initialEnergy)) * 100
+        ));
+        document.getElementById('maxDrift').textContent = maxDrift.toFixed(4) + '%';
+        
+        // Update angular momentum chart
+        this.drawChart(this.angularCtx, this.angularMomentumCanvas, simulation.angularMomentumHistory, '#8b5cf6', 'L');
+        const currentL = simulation.angularMomentumHistory[simulation.angularMomentumHistory.length - 1] || 0;
+        document.getElementById('angularMomentum').textContent = currentL.toFixed(3);
+        
+        // Update distance chart
+        this.drawChart(this.distanceCtx, this.distanceCanvas, simulation.distanceHistory, null, null, true, 
+            ['#ff6b6b', '#4ecdc4', '#ffe66d']);
+        
+        // Update Poincaré section if enabled
+        if (this.poincareCanvas && this.poincareCanvas.style.display !== 'none') {
+            this.drawPoincareSection();
+        }
+        
+        // Update Lyapunov exponent if enabled
+        if (simulation.lyapunovEnabled && simulation.lyapunovSamples > 10) {
+            const lambda = simulation.lyapunovSum / simulation.lyapunovSamples;
+            document.getElementById('lyapunovValue').textContent = lambda.toFixed(6);
+            
+            const indicator = document.getElementById('chaosIndicator');
+            if (lambda > 0.01) {
+                indicator.textContent = '🌀 Chaotic (λ > 0)';
+                indicator.style.color = '#ef4444';
+            } else if (lambda < -0.01) {
+                indicator.textContent = '⬇️ Stable (λ < 0)';
+                indicator.style.color = '#10b981';
+            } else {
+                indicator.textContent = '➡️ Neutral (λ ≈ 0)';
+                indicator.style.color = '#f59e0b';
+            }
+        }
+    }
+    
+    drawPoincareSection() {
+        const ctx = this.poincareCtx;
+        const canvas = this.poincareCanvas;
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        ctx.clearRect(0, 0, width, height);
+        
+        if (simulation.poincarePoints.length === 0) return;
+        
+        // Find ranges
+        const xValues = simulation.poincarePoints.map(p => p.x);
+        const vxValues = simulation.poincarePoints.map(p => p.vx);
+        
+        const xMin = Math.min(...xValues);
+        const xMax = Math.max(...xValues);
+        const vxMin = Math.min(...vxValues);
+        const vxMax = Math.max(...vxValues);
+        
+        const padding = 10;
+        
+        // Draw points
+        ctx.fillStyle = '#6366f1';
+        simulation.poincarePoints.forEach(point => {
+            const x = padding + ((point.x - xMin) / (xMax - xMin || 1)) * (width - 2 * padding);
+            const y = height - padding - ((point.vx - vxMin) / (vxMax - vxMin || 1)) * (height - 2 * padding);
+            
+            ctx.beginPath();
+            ctx.arc(x, y, 2, 0, Math.PI * 2);
+            ctx.fill();
+        });
+        
+        // Draw axes
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padding, height / 2);
+        ctx.lineTo(width - padding, height / 2);
+        ctx.moveTo(width / 2, padding);
+        ctx.lineTo(width / 2, height - padding);
+        ctx.stroke();
+    }
+    
+    exportCSV() {
+        if (!simulation || simulation.timeHistory.length === 0) {
+            alert('No data to export. Run the simulation first.');
+            return;
+        }
+        
+        let csv = 'Time,Body1_X,Body1_Y,Body1_VX,Body1_VY,Body2_X,Body2_Y,Body2_VX,Body2_VY,Body3_X,Body3_Y,Body3_VX,Body3_VY,Energy,AngularMomentum\n';
+        
+        // Note: This exports current state, not full history
+        // For full trajectory export, we'd need to store all positions
+        simulation.bodies.forEach((body, i) => {
+            if (i === 0) {
+                csv += `${simulation.time},${body.x},${body.y},${body.vx},${body.vy}`;
+            } else if (i < 3) {
+                csv += `,${body.x},${body.y},${body.vx},${body.vy}`;
+            }
+        });
+        csv += `,${simulation.calculateEnergy()},${simulation.calculateAngularMomentum()}\n`;
+        
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `three-body-data-${Date.now()}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+    
+    exportJSON() {
+        if (!simulation || simulation.bodies.length === 0) {
+            alert('No data to export. Run the simulation first.');
+            return;
+        }
+        
+        const data = {
+            timestamp: new Date().toISOString(),
+            preset: currentPreset,
+            integrator: simulation.integrator,
+            time: simulation.time,
+            bodies: simulation.bodies.map(b => ({
+                name: b.name,
+                mass: b.mass,
+                position: { x: b.x, y: b.y },
+                velocity: { vx: b.vx, vy: b.vy },
+                color: b.color
+            })),
+            energy: simulation.calculateEnergy(),
+            angularMomentum: simulation.calculateAngularMomentum(),
+            history: {
+                time: simulation.timeHistory,
+                energy: simulation.energyHistory,
+                angularMomentum: simulation.angularMomentumHistory,
+                distances: simulation.distanceHistory
+            }
+        };
+        
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `three-body-data-${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+    
+    generateShareLink() {
+        if (!simulation || simulation.bodies.length === 0) {
+            alert('No simulation to share. Load a preset first.');
+            return;
+        }
+        
+        const params = new URLSearchParams();
+        params.set('preset', currentPreset);
+        params.set('integrator', simulation.integrator);
+        
+        const url = window.location.origin + window.location.pathname + '?' + params.toString();
+        
+        navigator.clipboard.writeText(url).then(() => {
+            alert('Share link copied to clipboard!\n' + url);
+        }).catch(() => {
+            prompt('Copy this link:', url);
+        });
+    }
+}
+
+// ============================================
+// KEYBOARD SHORTCUTS
+// ============================================
+
+document.addEventListener('keydown', (e) => {
+    // Prevent default for our shortcuts
+    const key = e.key.toLowerCase();
+    
+    switch(key) {
+        case ' ': // Space - Play/Pause
+            e.preventDefault();
+            document.getElementById('playPauseBtn').click();
+            break;
+        case 'r': // R - Reset
+            document.getElementById('resetBtn').click();
+            break;
+        case 'c': // C - Clear trails
+            document.getElementById('clearTrailsBtn').click();
+            break;
+        case '+':
+        case '=': // + - Increase speed
+            e.preventDefault();
+            const speedSlider = document.getElementById('speedSlider');
+            speedSlider.value = Math.min(5, parseFloat(speedSlider.value) + 0.5);
+            speedSlider.dispatchEvent(new Event('input'));
+            break;
+        case '-':
+        case '_': // - - Decrease speed
+            e.preventDefault();
+            const speedSliderDec = document.getElementById('speedSlider');
+            speedSliderDec.value = Math.max(0.1, parseFloat(speedSliderDec.value) - 0.5);
+            speedSliderDec.dispatchEvent(new Event('input'));
+            break;
+        case 'g': // G - Toggle Center of Mass
+            document.getElementById('centerOfMassCheckbox').click();
+            break;
+        case 'v': // V - Toggle velocity vectors
+            document.getElementById('showVelocityCheckbox').click();
+            break;
+    }
+});
+
+// ============================================
+// CONFIGURATION TABLE UPDATE
+// ============================================
+
+function updateConfigTable() {
+    const tbody = document.getElementById('configTableBody');
+    
+    if (!simulation || simulation.bodies.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">No simulation running</td></tr>';
+        return;
+    }
+    
+    let html = '';
+    simulation.bodies.forEach((body, i) => {
+        const ke = 0.5 * body.mass * (body.vx ** 2 + body.vy ** 2);
+        html += `
+            <tr>
+                <td><span style="color:${body.color};">●</span> ${body.name}</td>
+                <td>${body.mass.toFixed(2)}</td>
+                <td>(${body.x.toFixed(3)}, ${body.y.toFixed(3)})</td>
+                <td>(${body.vx.toFixed(3)}, ${body.vy.toFixed(3)})</td>
+                <td>${ke.toFixed(3)}</td>
+            </tr>
+        `;
+    });
+    
+    tbody.innerHTML = html;
+}
+
+// Update config table periodically
+setInterval(() => {
+    if (simulation && !simulation.paused) {
+        updateConfigTable();
+        checkPeriodicity();
+    }
+}, 100);
+
+// ============================================
+// PERIOD CHECKING
+// ============================================
+
+function checkPeriodicity() {
+    if (!simulation || simulation.time < 10) return; // Need some run time
+    
+    try {
+        const period = simulation.detectPeriod();
+        const badge = document.getElementById('periodBadge');
+        if (!badge) return;
+        
+        if (period && period > 0) {
+            const periodValueElem = document.getElementById('periodValue');
+            if (periodValueElem) {
+                periodValueElem.textContent = period.toFixed(2) + ' years';
+            }
+            badge.style.display = 'flex';
+        } else if (simulation.time > 50 && !period) {
+            // Hide badge after enough time if no period detected
+            badge.style.display = 'none';
+        }
+    } catch (error) {
+        console.warn('Period detection error:', error);
+    }
+}
+
+// ============================================
+// COPY FUNCTIONS
+// ============================================
+
+function copyICAsJSON() {
+    try {
+        if (typeof PRESETS === 'undefined' || !PRESETS[currentPreset]) {
+            alert('No preset loaded');
+            return;
+        }
+        
+        const preset = PRESETS[currentPreset];
+        const data = {
+            name: preset.name || currentPreset,
+            integrator: simulation.integrator,
+            bodies: preset.bodies.map(b => ({
+                name: b.name,
+                mass: b.mass,
+                position: { x: b.x, y: b.y },
+                velocity: { vx: b.vx, vy: b.vy },
+                color: b.color
+            }))
+        };
+        
+        const json = JSON.stringify(data, null, 2);
+        
+        navigator.clipboard.writeText(json).then(() => {
+            alert('✓ Initial conditions copied as JSON to clipboard!');
+        }).catch(() => {
+            prompt('Copy this JSON:', json);
+        });
+    } catch (error) {
+        console.error('Copy JSON error:', error);
+        alert('Error copying data: ' + error.message);
+    }
+}
+
+function copyICAsText() {
+    try {
+        if (typeof PRESETS === 'undefined' || !PRESETS[currentPreset]) {
+            alert('No preset loaded');
+            return;
+        }
+        
+        const preset = PRESETS[currentPreset];
+        let text = `${preset.name || currentPreset}\n`;
+        text += '='.repeat(50) + '\n\n';
+        
+        preset.bodies.forEach((body, i) => {
+            text += `${body.name}:\n`;
+            text += `  Mass:     ${body.mass.toFixed(6)}\n`;
+            text += `  Position: (${body.x.toFixed(6)}, ${body.y.toFixed(6)})\n`;
+            text += `  Velocity: (${body.vx.toFixed(6)}, ${body.vy.toFixed(6)})\n\n`;
+        });
+        
+        navigator.clipboard.writeText(text).then(() => {
+            alert('✓ Initial conditions copied as text to clipboard!');
+        }).catch(() => {
+            prompt('Copy this text:', text);
+        });
+    } catch (error) {
+        console.error('Copy text error:', error);
+        alert('Error copying data: ' + error.message);
+    }
 }
 
 // Start the application when the page loads
