@@ -336,11 +336,11 @@ class Simulation {
 
     detectPeriod() {
         // Only check periodicity every 5 time units to avoid false positives
-        if (this.time - this.lastPeriodCheck < 5) return;
+        if (this.time - this.lastPeriodCheck < 5) return null;
         this.lastPeriodCheck = this.time;
         
         // Need at least 100 points
-        if (this.positionHistory.length < 100) return;
+        if (this.positionHistory.length < 100) return null;
         
         // Simple period detection: look for when body returns near starting position
         const startPos = this.positionHistory[0];
@@ -363,6 +363,11 @@ class Simulation {
                     const period = this.timeHistory[i] - this.timeHistory[0];
                     if (period > 1.0) {  // Minimum reasonable period
                         this.detectedPeriod = period;
+                        this.periodConfidence = {
+                            positionError: dist,
+                            velocityError: vdist,
+                            threshold: threshold
+                        };
                         return period;
                     }
                 }
@@ -1399,17 +1404,51 @@ function init() {
         console.log('✓ Analysis Controller created');
 
         console.log('Loading initial preset...');
-        uiController.loadPreset('figure8');
-        console.log('✓ Initial preset loaded');
         
         // Check for URL parameters to load shared configuration
         const params = new URLSearchParams(window.location.search);
-        if (params.has('preset')) {
+        let loadedFromURL = false;
+        
+        // Check if we have full body parameters in URL
+        if (params.has('m1') && params.has('x1') && params.has('y1') && params.has('vx1') && params.has('vy1')) {
+            console.log('Loading configuration from URL parameters...');
+            
+            // Load custom bodies from URL
+            const bodies = [];
+            for (let i = 1; i <= 3; i++) {
+                if (params.has(`m${i}`)) {
+                    bodies.push({
+                        name: `Body ${i}`,
+                        mass: parseFloat(params.get(`m${i}`)),
+                        x: parseFloat(params.get(`x${i}`)),
+                        y: parseFloat(params.get(`y${i}`)),
+                        vx: parseFloat(params.get(`vx${i}`)),
+                        vy: parseFloat(params.get(`vy${i}`))
+                    });
+                }
+            }
+            
+            if (bodies.length > 0) {
+                simulation.loadBodies(bodies);
+                loadedFromURL = true;
+                console.log(`✓ Loaded ${bodies.length} bodies from URL`);
+            }
+        } else if (params.has('preset')) {
             const preset = params.get('preset');
             if (typeof PRESETS !== 'undefined' && PRESETS[preset]) {
                 uiController.loadPreset(preset);
+                loadedFromURL = true;
+                console.log(`✓ Loaded preset "${preset}" from URL`);
             }
         }
+        
+        // Load default preset if nothing from URL
+        if (!loadedFromURL) {
+            uiController.loadPreset('figure8');
+            console.log('✓ Initial preset loaded');
+        }
+        
+        // Apply integrator from URL if specified
         if (params.has('integrator')) {
             const integrator = params.get('integrator');
             if (integrator === 'verlet' || integrator === 'rk4') {
@@ -1418,6 +1457,16 @@ function init() {
                 if (integratorSelect) {
                     integratorSelect.value = integrator;
                 }
+                console.log(`✓ Set integrator to "${integrator}" from URL`);
+            }
+        }
+        
+        // Apply time step from URL if specified
+        if (params.has('dt')) {
+            const dt = parseFloat(params.get('dt'));
+            if (!isNaN(dt) && dt > 0 && dt < 1) {
+                simulation.dt = dt;
+                console.log(`✓ Set time step to ${dt} from URL`);
             }
         }
 
@@ -1607,6 +1656,7 @@ class AnalysisController {
         }
         
         // Update Lyapunov exponent if enabled
+        const lyapunovDisplay = document.getElementById('lyapunovDisplay');
         if (simulation.lyapunovEnabled && simulation.lyapunovSamples > 10) {
             const lambda = simulation.lyapunovSum / simulation.lyapunovSamples;
             document.getElementById('lyapunovValue').textContent = lambda.toFixed(6);
@@ -1621,6 +1671,16 @@ class AnalysisController {
             } else {
                 indicator.textContent = '➡️ Neutral (λ ≈ 0)';
                 indicator.style.color = '#f59e0b';
+            }
+            
+            // Show the display once we have data
+            if (lyapunovDisplay && lyapunovDisplay.style.display !== 'block') {
+                lyapunovDisplay.style.display = 'block';
+            }
+        } else if (simulation.lyapunovEnabled && lyapunovDisplay) {
+            // Keep hidden until we have samples
+            if (simulation.lyapunovSamples === 0) {
+                lyapunovDisplay.style.display = 'none';
             }
         }
     }
@@ -1740,13 +1800,30 @@ class AnalysisController {
         }
         
         const params = new URLSearchParams();
-        params.set('preset', currentPreset);
+        
+        // Include preset name for convenience
+        if (currentPreset) {
+            params.set('preset', currentPreset);
+        }
+        
+        // Include integrator and time step
         params.set('integrator', simulation.integrator);
+        params.set('dt', simulation.dt);
+        
+        // Encode all body parameters for perfect reproducibility
+        simulation.bodies.forEach((body, i) => {
+            params.set(`m${i+1}`, body.mass);
+            params.set(`x${i+1}`, body.x);
+            params.set(`y${i+1}`, body.y);
+            params.set(`vx${i+1}`, body.vx);
+            params.set(`vy${i+1}`, body.vy);
+        });
         
         const url = window.location.origin + window.location.pathname + '?' + params.toString();
         
         navigator.clipboard.writeText(url).then(() => {
-            alert('Share link copied to clipboard!\n' + url);
+            const msg = 'Share link copied to clipboard!\n\nThis link includes all initial conditions for perfect reproducibility.\n\n' + url;
+            alert(msg);
         }).catch(() => {
             prompt('Copy this link:', url);
         });
@@ -1803,9 +1880,12 @@ function updateConfigTable() {
     const tbody = document.getElementById('configTableBody');
     
     if (!simulation || simulation.bodies.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">No simulation running</td></tr>';
+        tbody.style.display = 'none';
         return;
     }
+    
+    // Show table when simulation is active
+    tbody.style.display = '';
     
     let html = '';
     simulation.bodies.forEach((body, i) => {
@@ -1849,6 +1929,15 @@ function checkPeriodicity() {
             if (periodValueElem) {
                 periodValueElem.textContent = period.toFixed(2) + ' years';
             }
+            
+            // Add tooltip with confidence info
+            if (simulation.periodConfidence) {
+                const conf = simulation.periodConfidence;
+                const posErr = (conf.positionError / conf.threshold * 100).toFixed(1);
+                const velErr = (conf.velocityError / conf.threshold * 100).toFixed(1);
+                badge.title = `Period detected with:\nPosition match: ${posErr}% of threshold\nVelocity match: ${velErr}% of threshold\n(Lower is better)`;
+            }
+            
             badge.style.display = 'flex';
         } else if (simulation.time > 50 && !period) {
             // Hide badge after enough time if no period detected
