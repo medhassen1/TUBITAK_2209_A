@@ -348,7 +348,7 @@ MIT License - Feel free to use this code for educational or personal projects!
 
 ## 👨‍💻 Author
 
-Created with ❤️ for physics enthusiasts and curious minds everywhere.
+Mohamed Zeyadne && Ibrahim el Saw.
 
 ## 🙏 Acknowledgments
 
@@ -362,3 +362,4 @@ Created with ❤️ for physics enthusiasts and curious minds everywhere.
 **Enjoy exploring the beautiful chaos of the Three-Body Problem!** 🌌
 
 If you find this simulator helpful or interesting, please consider giving it a star ⭐
+
