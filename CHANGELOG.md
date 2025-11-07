@@ -217,7 +217,7 @@ These features can be added in future iterations if needed for the TÜBİTAK rep
 
 ## Credits
 
-**Developer:** TÜBİTAK 2209-A Research Team  
+**Developer:** Mohamed Zeyadne & Ibrahim el Saw 
 **Physics Reference:** Šuvakov & Dmitrašinović (2013)  
 **Integrators:** RK4 (classical), Velocity Verlet (symplectic)  
 **Framework:** Vanilla JavaScript + HTML5 Canvas  
@@ -225,3 +225,4 @@ These features can be added in future iterations if needed for the TÜBİTAK rep
 ---
 
 *This simulator is designed for educational and research purposes.*
+
